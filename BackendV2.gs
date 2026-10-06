@@ -158,7 +158,7 @@ function levelPlayedParse(json, courseRow) {
   //add any new extra clears
   newClears = newClears.concat(oExceptionHandler(exceptionsRow, currentClearsPIDs))
 
-  //if theres nothing new we can exit the function 
+  //if theres nothing new we can exit the function
   if (newClears.length == 0) {
     return;
   }
@@ -282,7 +282,7 @@ function deletedLevelsHandler() {
 }
 
 function printUploaderInfoLocal(uploaderInfo, placement) {
-  //since the PlayerClearsLocal sheet isnt ordered by placement, we have to match placements to their actual row on the sheet 
+  //since the PlayerClearsLocal sheet isnt ordered by placement, we have to match placements to their actual row on the sheet
   if (placement != PlayerClearsLocal.getRange(placement, 3)) {
     var row = placementToRow(placement)
   } else {
@@ -315,7 +315,7 @@ function printDeletedInfoLocal(index, placement) {
     console.log("No deleted level data found for placement " + placement + ", skipping")
     return;
   }
-  
+
   if (placement != PlayerClearsLocal.getRange(placement, 3)) {
     var row = placementToRow(placement)
   } else {
@@ -337,6 +337,32 @@ function placementToRow(placement) {
   return null
 }
 
+// ── Keeps Player Clears Local Storage in sync with the current List order ──
+//
+// This function has two jobs now instead of one:
+//
+//   1. (Original behavior) Add a brand-new row for any CourseID that's on
+//      the List but has never been tracked on this sheet before.
+//
+//   2. (NEW) For every CourseID that's ALREADY tracked, check whether its
+//      recorded placement (column B) still matches where it actually sits
+//      on the List right now — and correct it if not.
+//
+// #2 is what was missing, and it's the actual root cause of the duplicate-
+// placement problem. Previously, a row's column B only ever got written
+// once, at the moment the row was first created — nothing ever revisited it
+// afterward. So when the list got reordered (a level added, or levels
+// shuffled), a level that moved off placement, say, 28 kept a permanently
+// stale "28" in column B forever. That wasn't a problem on its own — until
+// some brand-new level later landed on placement 28 for real. This function
+// would correctly add a fresh row for that new level with the correct
+// placement 28 (step 1 above), but nothing corrected or removed the old
+// stale row — so you'd end up with two different rows both showing "28" in
+// column B, which is exactly the duplicate pattern in the screenshot.
+//
+// With step 2 added, every tracked level's placement gets re-verified (and
+// silently corrected if needed) on every run, so stale values can't
+// accumulate anymore. Safe to run anytime, including manually.
 function findNewLevels() {
   var lastRow = PlayerClearsLocal.getLastRow() + 1
   var localIDs = PlayerClearsLocal.getRange("A1:A" + lastRow).getValues().map(function (row) { return row[0]; });
@@ -345,22 +371,117 @@ function findNewLevels() {
   var newLevels = 0
 
   for (index = 0; index < 100; index++) {
-    if (localIDs.indexOf(listIDs[index]) == -1) {
-      var placement = index + 1;
-      if (existingPlacements.indexOf(placement) != -1) {
-        console.log("placement " + placement + " already exists in column B, skipping to avoid duplicate");
-        continue;
+    var currentPlacement = index + 1;
+    var localRowIndex = localIDs.indexOf(listIDs[index]);
+
+    if (localRowIndex != -1) {
+      // Already tracked — make sure column B still matches reality.
+      var sheetRow = localRowIndex + 1;
+      var recordedPlacement = existingPlacements[localRowIndex];
+      if (recordedPlacement !== currentPlacement) {
+        console.log("level '" + listIDs[index] + "' recorded at placement " + recordedPlacement + ", actually at " + currentPlacement + " — correcting column B");
+        ChangeLog.getRange(ChangeLog.getLastRow() + 1, 1).setValue(
+          "'" + (ListPage.getRange(currentPlacement, 1).getValue() || listIDs[index]) + "' placement corrected from " +
+          recordedPlacement + " to " + currentPlacement + " on Date: " + formatedDate
+        );
+        PlayerClearsLocal.getRange(sheetRow, 2).setValue(currentPlacement);
+        existingPlacements[localRowIndex] = currentPlacement; // keep our in-memory copy in sync for the rest of this run
       }
-      console.log("level not on local clears page found at placement ", placement, " adding it now");
-      changeLogAdd(ListPage.getRange(placement, 1).getValue(), placement, newLevels)
-      PlayerClearsLocal.getRange(lastRow, 1).setValue(ListPage.getRange(placement, 3).getValue())
-      PlayerClearsLocal.getRange(lastRow, 2).setValue(placement)
-      newLevels += 1
-      lastRow += 1
+      continue;
     }
+
+    // Genuinely new CourseID we've never tracked before.
+    if (existingPlacements.indexOf(currentPlacement) != -1) {
+      console.log("placement " + currentPlacement + " already exists in column B, skipping to avoid duplicate");
+      continue;
+    }
+    console.log("level not on local clears page found at placement ", currentPlacement, " adding it now");
+    changeLogAdd(ListPage.getRange(currentPlacement, 1).getValue(), currentPlacement, newLevels)
+    PlayerClearsLocal.getRange(lastRow, 1).setValue(ListPage.getRange(currentPlacement, 3).getValue())
+    PlayerClearsLocal.getRange(lastRow, 2).setValue(currentPlacement)
+    localIDs.push(listIDs[index]);
+    existingPlacements.push(currentPlacement);
+    newLevels += 1
+    lastRow += 1
   }
   //sort PlayerClearsLocal for consistancy, sorting doesnt even work cause we need to wait for the trigger to end before we can even sort lol
   PlayerClearsLocal.sort(2)
+}
+
+// ── Read-only health check for Player Clears Local Storage ──
+//
+// Doesn't change anything — just reports, in the console (View > Logs after
+// running), the current state of the sheet:
+//
+//   1. "mismatches" — rows whose column A CourseID is still somewhere on
+//      the current List, but column B doesn't match its real placement.
+//      This is exactly what the duplicate-placement problem looks like
+//      before it's fixed. Run findNewLevels() to correct these.
+//
+//   2. "orphaned" — rows whose CourseID isn't found anywhere on the current
+//      List at all, meaning that level has fallen completely off the Top
+//      100. Nothing in this codebase currently cleans these up
+//      automatically — that's a separate, pre-existing gap, not something
+//      this fix addresses — so they're only reported here for you to
+//      review and decide on by hand (archive the row elsewhere, or delete
+//      it, whichever you'd rather do). If a "duplicate placement" remains
+//      after running findNewLevels(), it's almost always one of these
+//      orphaned rows still squatting on a placement number a real level
+//      now legitimately holds.
+//
+//   3. "duplicatePlacements" — any placement numbers currently claimed by
+//      more than one row, straight from column B, as a quick sanity check.
+//
+// Safe to run anytime, as often as you like.
+function auditPlayerClearsPlacements() {
+  var listIDs = ListPage.getRange("C1:C100").getValues().map(function (row) { return row[0]; });
+  var courseIdToPlacement = {};
+  for (var i = 0; i < listIDs.length; i++) {
+    courseIdToPlacement[listIDs[i]] = i + 1;
+  }
+
+  var lastRow = PlayerClearsLocal.getLastRow();
+  var data = PlayerClearsLocal.getRange(1, 1, lastRow, 2).getValues(); // columns A & B
+
+  var mismatches = [];
+  var orphaned = [];
+  var seenPlacements = {};
+  var duplicatePlacements = {};
+
+  for (var row = 0; row < data.length; row++) {
+    var courseID = data[row][0];
+    var recordedPlacement = data[row][1];
+    if (!courseID) continue;
+
+    var truePlacement = courseIdToPlacement[courseID];
+
+    if (truePlacement === undefined) {
+      orphaned.push({ sheetRow: row + 1, courseID: courseID, recordedPlacement: recordedPlacement });
+    } else if (truePlacement !== recordedPlacement) {
+      mismatches.push({ sheetRow: row + 1, courseID: courseID, recordedPlacement: recordedPlacement, truePlacement: truePlacement });
+    }
+
+    if (recordedPlacement) {
+      if (seenPlacements[recordedPlacement]) {
+        duplicatePlacements[recordedPlacement] = true;
+      }
+      seenPlacements[recordedPlacement] = true;
+    }
+  }
+
+  console.log("=== Player Clears Local Storage audit ===");
+  console.log(mismatches.length + " row(s) with a placement that doesn't match the current List:");
+  mismatches.forEach(function (m) {
+    console.log("  Row " + m.sheetRow + ": " + m.courseID + " recorded as #" + m.recordedPlacement + ", actually #" + m.truePlacement);
+  });
+  console.log(orphaned.length + " row(s) whose CourseID isn't on the current Top 100 at all (fell off the list):");
+  orphaned.forEach(function (o) {
+    console.log("  Row " + o.sheetRow + ": " + o.courseID + " (recorded placement #" + o.recordedPlacement + ")");
+  });
+  var dupPlacements = Object.keys(duplicatePlacements);
+  console.log(dupPlacements.length + " placement number(s) currently claimed by more than one row: " + dupPlacements.join(", "));
+
+  return { mismatches: mismatches, orphaned: orphaned, duplicatePlacements: dupPlacements };
 }
 
 function getLevelPlayedInfo(placement) {
@@ -411,7 +532,7 @@ function updateListEveryMin() {
     console.log("Another instance is running, skipping this trigger execution");
     return;
   }
-  
+
   try {
   var lastIndex = 0
   for (var index = 1; index <= 7; index++) {
@@ -448,9 +569,9 @@ function runner(n) {
   if (n == 3) { updatePlacementsRange("Range", 0, 24) }
 if (n == 4) { updatePlacementsRange("Range", 24, 47) }
 if (n == 5) { updatePlacementsRange("Range", 43, 70) }
-if (n == 6) { 
+if (n == 6) {
   var validCount = getAllValidCourseIDs().placements.length;
-  updatePlacementsRange("Range", 70, validCount); 
+  updatePlacementsRange("Range", 70, validCount);
 }
 if (n == 7) {
   ByPass.getRange(1, 2, 7, 1).setValue(0);
@@ -495,15 +616,15 @@ function getProjectTriggersByName(name) {
 
 function debugLeaderboardUpdate() {
   console.log("=== DIAGNOSING LEADERBOARD UPDATE ===");
-  
+
   // Get the PID of the player who should have updated points
   var pidToCheck = 120666286361882; // Replace with your player's PID
-  
+
   // Check if the player has cleared the level in PlayerClearsLocal
   var finder = PlayerClearsLocal.createTextFinder(pidToCheck.toString());
   var found = finder.findAll();
   console.log("Player appears in PlayerClearsLocal:", found.length, "times");
-  
+
   // Check if the player's points were actually recalculated
   var pidTable = PIDTable.getRange(1, 1, PIDTable.getLastRow(), 3).getValues();
   for (var i = 0; i < pidTable.length; i++) {
@@ -513,11 +634,11 @@ function debugLeaderboardUpdate() {
       break;
     }
   }
-  
+
   // Run the full update
   console.log("Running leaderboardUpdatev2()...");
   leaderboardUpdatev2();
-  
+
   console.log("=== UPDATE COMPLETE. Check the leaderboard now. ===");
 }
 
@@ -541,11 +662,6 @@ function deleteAllTriggers() {
 
 function debugfunc(){
   runner(1)
-  
-
-  
-  
-  
 }
 
 function auditPlacementColumn() {
@@ -554,4 +670,3 @@ function auditPlacementColumn() {
     console.log("Row " + (i+1) + ": " + data[i][0]);
   }
 }
-
